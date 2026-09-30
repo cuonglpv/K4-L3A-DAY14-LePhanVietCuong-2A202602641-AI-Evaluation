@@ -527,10 +527,19 @@ class BenchmarkRunner:
         Returns:
             List of EvalResult, one per qa_pair.
         """
-        # TODO: for each pair, call agent_fn(pair.question), then run_full_eval.
-        # Pass pair.retrieved_contexts as the optional contexts argument and
-        # preserve the original pair on the returned EvalResult.
-        raise NotImplementedError("Implement BenchmarkRunner.run")
+        results: list[EvalResult] = []
+        for pair in qa_pairs:
+            answer = agent_fn(pair.question)
+            result = evaluator.run_full_eval(
+                answer=answer,
+                question=pair.question,
+                context=pair.context,
+                expected=pair.expected_answer,
+                contexts=pair.retrieved_contexts,
+            )
+            result.qa_pair = pair
+            results.append(result)
+        return results
 
     def generate_report(self, results: list[EvalResult]) -> dict[str, Any]:
         """
@@ -552,8 +561,38 @@ class BenchmarkRunner:
         Average only non-None retrieval scores. Return None for a retrieval
         average when no result contains that metric.
         """
-        # TODO
-        raise NotImplementedError("Implement generate_report")
+        total = len(results)
+        passed = sum(result.passed for result in results)
+
+        def average(attribute: str) -> float:
+            if not results:
+                return 0.0
+            return sum(float(getattr(result, attribute)) for result in results) / total
+
+        def optional_average(attribute: str) -> float | None:
+            values = [
+                float(value)
+                for result in results
+                if (value := getattr(result, attribute)) is not None
+            ]
+            return sum(values) / len(values) if values else None
+
+        failure_types: dict[str, int] = {}
+        for result in results:
+            if not result.passed and result.failure_type is not None:
+                failure_types[result.failure_type] = failure_types.get(result.failure_type, 0) + 1
+
+        return {
+            "total": total,
+            "passed": passed,
+            "pass_rate": passed / total if total else 0.0,
+            "avg_faithfulness": average("faithfulness"),
+            "avg_relevance": average("relevance"),
+            "avg_completeness": average("completeness"),
+            "avg_context_recall": optional_average("context_recall"),
+            "avg_context_precision": optional_average("context_precision"),
+            "failure_types": failure_types,
+        }
 
     def run_regression(self, new_results: list, baseline_results: list) -> dict:
         """Compare new evaluation results against a baseline.
@@ -577,7 +616,34 @@ class BenchmarkRunner:
 
         TODO: Compute avg per metric, compare, list regressions, set passed flag
         """
-        raise NotImplementedError
+        metric_names = ("faithfulness", "relevance", "completeness")
+
+        def metric_average(results: list, metric: str) -> float:
+            if not results:
+                return 0.0
+            return sum(float(getattr(result, metric)) for result in results) / len(results)
+
+        new_averages = {metric: metric_average(new_results, metric) for metric in metric_names}
+        baseline_averages = {
+            metric: metric_average(baseline_results, metric) for metric in metric_names
+        }
+        regressions = [
+            metric
+            for metric in metric_names
+            if baseline_averages[metric] - new_averages[metric] > 0.05
+        ]
+        result = {
+            f"new_avg_{metric}": value for metric, value in new_averages.items()
+        }
+        result.update(
+            {
+                f"baseline_avg_{metric}": value
+                for metric, value in baseline_averages.items()
+            }
+        )
+        result["regressions"] = regressions
+        result["passed"] = not regressions
+        return result
 
     def identify_failures(
         self,
@@ -594,8 +660,18 @@ class BenchmarkRunner:
         Returns:
             List of failing EvalResults.
         """
-        # TODO
-        raise NotImplementedError("Implement identify_failures")
+        return [
+            result
+            for result in results
+            if any(
+                score < threshold
+                for score in (
+                    result.faithfulness,
+                    result.relevance,
+                    result.completeness,
+                )
+            )
+        ]
 
 
 # ---------------------------------------------------------------------------
@@ -629,8 +705,11 @@ class FailureAnalyzer:
             dict mapping failure_type → count.
             Example: {"hallucination": 3, "irrelevant": 2, "incomplete": 5}
         """
-        # TODO
-        raise NotImplementedError("Implement categorize_failures")
+        categories: dict[str, int] = {}
+        for failure in failures:
+            if failure.failure_type is not None:
+                categories[failure.failure_type] = categories.get(failure.failure_type, 0) + 1
+        return categories
 
     def find_root_cause(self, failure: EvalResult) -> str:
         """
@@ -642,8 +721,20 @@ class FailureAnalyzer:
             "Answer is missing key information — increase context window or improve generation"
             "Multiple issues detected — review full pipeline"
         """
-        # TODO: compare faithfulness, relevance, completeness, return appropriate string
-        raise NotImplementedError("Implement find_root_cause")
+        scores = {
+            "faithfulness": failure.faithfulness,
+            "relevance": failure.relevance,
+            "completeness": failure.completeness,
+        }
+        minimum = min(scores.values())
+        lowest = [name for name, score in scores.items() if score == minimum]
+        if len(lowest) != 1:
+            return "Multiple issues detected — review full pipeline"
+        return {
+            "faithfulness": "Context is missing or irrelevant — improve retrieval",
+            "relevance": "Answer does not address the question — improve prompt clarity",
+            "completeness": "Answer is missing key information — increase context window or improve generation",
+        }[lowest[0]]
 
     def generate_improvement_log(self, failures: list, suggestions: list[str]) -> str:
         """Generate a Markdown table logging failures and improvement actions.
@@ -662,7 +753,27 @@ class FailureAnalyzer:
 
         TODO: Build markdown table with failure details + matched suggestions
         """
-        raise NotImplementedError
+        header = (
+            "| Failure ID | Type | Root Cause | Suggested Fix | Status |\n"
+            "|------------|------|------------|---------------|--------|"
+        )
+        rows = []
+        for index, failure in enumerate(failures, start=1):
+            suggestion = (
+                suggestions[index - 1]
+                if index - 1 < len(suggestions)
+                else "Review the trace and add a targeted regression case"
+            )
+            values = [
+                f"F{index:03d}",
+                failure.failure_type or "unclassified",
+                self.find_root_cause(failure),
+                suggestion,
+                "Open",
+            ]
+            escaped = [str(value).replace("|", "\\|").replace("\n", " ") for value in values]
+            rows.append("| " + " | ".join(escaped) + " |")
+        return "\n".join([header, *rows])
 
     def generate_improvement_suggestions(
         self, failures: list[EvalResult]
@@ -680,8 +791,36 @@ class FailureAnalyzer:
         Returns:
             List of at least 3 suggestion strings (or fewer if failures is empty).
         """
-        # TODO: analyze categorized failures and return suggestions
-        raise NotImplementedError("Implement generate_improvement_suggestions")
+        if not failures:
+            return []
+
+        categories = self.categorize_failures(failures)
+        suggestions: list[str] = []
+        category_suggestions = {
+            "hallucination": "Add a claim-grounding check that rejects unsupported statements before responding",
+            "irrelevant": "Add intent-focused prompt examples and verify the answer addresses the customer's question",
+            "incomplete": "Improve retrieval coverage and require answers to include all policy conditions and exceptions",
+            "off_topic": "Add intent classification and route unsupported requests to the scoped refusal response",
+            "refusal": "Calibrate safety rules with allowed customer-support examples to reduce unnecessary refusals",
+        }
+        for category, _count in sorted(categories.items(), key=lambda item: (-item[1], item[0])):
+            suggestions.append(
+                category_suggestions.get(
+                    category.lower(),
+                    f"Review {category} traces and add a targeted regression test",
+                )
+            )
+
+        general_suggestions = [
+            "Add the failed cases to a versioned regression benchmark and compare every release",
+            "Log retrieved chunk ranks and source documents so retrieval and generation failures can be separated",
+            "Calibrate score thresholds against human-reviewed OrbitTech support answers",
+        ]
+        for suggestion in general_suggestions:
+            if len(suggestions) >= 3:
+                break
+            suggestions.append(suggestion)
+        return suggestions
 
 
 # ---------------------------------------------------------------------------
